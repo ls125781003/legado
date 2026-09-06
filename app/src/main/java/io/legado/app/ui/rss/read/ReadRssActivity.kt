@@ -99,6 +99,7 @@ import io.legado.app.help.webView.WebViewPool.DATA_HTML
 import io.legado.app.help.webView.toWebViewRequestConfig
 import io.legado.app.help.webView.shouldInjectPreloadJs
 import io.legado.app.model.Download
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers.IO
 import java.lang.ref.WeakReference
 import splitties.systemservices.powerManager
@@ -648,6 +649,7 @@ class ReadRssActivity :
                         getModifiedContentWithJs(url, request) ?: super.shouldInterceptRequest(view, request)
                     }
                 }
+                return super.shouldInterceptRequest(view, request)
             } else if (!jsInjected && url == nameUrl) {
                 jsInjected = true
                 val preloadJs = source.preloadJs ?: ""
@@ -671,20 +673,114 @@ class ReadRssActivity :
             } else {
                 val whitelist = source.contentWhitelist?.splitNotBlank(",")
                 if (!whitelist.isNullOrEmpty()) {
+                    var matched = false
                     whitelist.forEach {
                         try {
                             if (url.startsWith(it) || url.matches(it.toRegex())) {
-                                return super.shouldInterceptRequest(view, request)
+                                matched = true
                             }
                         } catch (e: PatternSyntaxException) {
                             val msg = "白名单规则正则语法错误 源名称:${source.sourceName} 正则:$it"
                             AppLog.put(msg, e)
                         }
                     }
-                    return createEmptyResource()
+                    if (!matched) return createEmptyResource()
                 }
             }
+            if (AppConfig.isCronet && RssWebResourceProxy.shouldProxy(
+                    url = url,
+                    method = request.method,
+                    isForMainFrame = request.isForMainFrame,
+                    requestHeaders = request.requestHeaders,
+                    preloadUrl = nameUrl,
+                )
+            ) {
+                return runBlocking(IO) { getProxiedResource(request) }
+            }
             return super.shouldInterceptRequest(view, request)
+        }
+
+        private suspend fun getProxiedResource(request: WebResourceRequest): WebResourceResponse {
+            val url = request.url.toString()
+            val sameOrigin = isSameOrigin(url)
+            val sourceCookie = if (sameOrigin) {
+                viewModel.headerMap.entries.firstOrNull {
+                    it.key.equals("Cookie", ignoreCase = true)
+                }?.value
+            } else null
+            val cookie = runCatching {
+                CookieManager.mergeCookies(
+                    sourceCookie,
+                    runCatching { CookieStore.getCookie(url) }.getOrNull(),
+                    runCatching { webCookieManager.getCookie(url) }.getOrNull(),
+                )
+            }.getOrNull()
+            val response = try {
+                okHttpClient.newCallResponse {
+                    url(url)
+                    method(request.method, null)
+                    RssWebResourceProxy.requestHeaders(
+                        sourceHeaders = if (sameOrigin) viewModel.headerMap else emptyMap(),
+                        webViewHeaders = request.requestHeaders,
+                        cookie = cookie,
+                    ).forEach { (name, value) -> header(name, value) }
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                AppLog.put("RSS 子资源 Cronet 请求失败\n$url\n${error.localizedMessage}", error)
+                return createProxyErrorResource()
+            }
+
+            response.headers("Set-Cookie").forEach { setCookie ->
+                webCookieManager.setCookie(url, setCookie)
+            }
+            if (!RssWebResourceProxy.supportsStatus(response.code)) {
+                response.close()
+                AppLog.put("RSS 子资源收到不支持的重定向状态 ${response.code}\n$url")
+                return createProxyErrorResource()
+            }
+
+            val body = response.body
+            val contentType = body.contentType()?.toString()
+            return WebResourceResponse(
+                RssWebResourceProxy.mimeType(contentType) ?: "application/octet-stream",
+                RssWebResourceProxy.encoding(contentType) ?: "utf-8",
+                RssProxyResponseInputStream(response, body),
+            ).also { webResponse ->
+                webResponse.setStatusCodeAndReasonPhrase(
+                    response.code,
+                    RssWebResourceProxy.reasonPhrase(response.message),
+                )
+                webResponse.responseHeaders = RssWebResourceProxy.responseHeaders(response.headers)
+            }
+        }
+
+        private fun createProxyErrorResource(): WebResourceResponse {
+            return WebResourceResponse(
+                "text/plain",
+                "utf-8",
+                ByteArrayInputStream("RSS resource unavailable".toByteArray()),
+            ).also {
+                it.setStatusCodeAndReasonPhrase(502, "Bad Gateway")
+            }
+        }
+
+        private fun isSameOrigin(url: String): Boolean {
+            val target = url.toUri()
+            if (target.scheme !in setOf("http", "https") || target.host.isNullOrBlank()) return false
+            val page = sequenceOf(
+                currentWebView.url,
+                viewModel.rssArticle?.let { article ->
+                    NetworkUtils.getAbsoluteURL(article.origin, article.link)
+                },
+            ).filterNotNull()
+                .map(String::toUri)
+                .firstOrNull { it.scheme in setOf("http", "https") && !it.host.isNullOrBlank() }
+                ?: return false
+            return target.scheme.equals(page.scheme, ignoreCase = true)
+                && target.host.equals(page.host, ignoreCase = true)
+                && (target.port == page.port || target.port == -1 && page.port == -1)
         }
 
         private suspend fun getModifiedContentWithJs(url: String, request: WebResourceRequest): WebResourceResponse? {
